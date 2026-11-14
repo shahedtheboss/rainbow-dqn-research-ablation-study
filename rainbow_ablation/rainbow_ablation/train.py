@@ -5,23 +5,34 @@ import math
 import time
 import random
 from collections import Counter
+import argparse
+import csv
+import json
+import subprocess
+import sys
+from datetime import datetime
 
+import matplotlib
+matplotlib.use("Agg")          
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import rclpy
 from std_srvs.srv import Empty
+from rclpy.utilities import remove_ros_args
 
 from rainbow_ablation.environment import RobotEnvironment
 from rainbow_ablation.agent import RainbowDQNAgent
 
 
-SEED = 42
-EPISODES = 300
+# (study protocol: 200 episodes, greedy check every 20 episodes with 5 tests)
+SEED = 1
+EPISODES = 200
+EVAL_EVERY = 20             # greedy evaluation every N training episodes (0 = off)
+EVAL_EPISODES = 5
+
 MAX_STEPS = 250
 UPDATES_PER_STEP = 2        # gradient updates per environment step (sim is the bottleneck)
-EVAL_EVERY = 25             # greedy evaluation every N training episodes (0 = off)
-EVAL_EPISODES = 3
 START_POSE = (0.0, 0.0, 0.0)  # TRUE world pose of the robot after a Gazebo reset
                               # (check your launch file's x_pose / y_pose)
 
@@ -31,10 +42,12 @@ CURRICULUM = False
 CURRICULUM_GOALS = [(60, (1.0, -1.0)), (120, (1.5, -1.5))]  # (until_episode, goal)
 FINAL_GOAL = (2.0, -2.0)
 
-# Guided exploration. An untrained NoisyNet acts almost deterministically and 6 of
-# the 7 actions turn, so early episodes wander near the start. For the first
-# GUIDED_EPISODES episodes a simple obstacle-aware goal-seeker picks the action with
-# probability decaying from GUIDED_START to GUIDED_END; every transition is stored.
+""" 
+  Guided exploration. An untrained NoisyNet acts almost deterministically and 6 of
+  the 7 actions turn, so early episodes wander near the start. For the first
+  GUIDED_EPISODES episodes a simple obstacle-aware goal-seeker picks the action with
+  probability decaying from GUIDED_START to GUIDED_END; every transition is stored.
+"""  
 GUIDED_START = 0.8
 GUIDED_END = 0.1
 GUIDED_EPISODES = 100
@@ -83,7 +96,11 @@ def prepare_episode(env, first):
     return True
 
 
-def guided_probability(episode):
+# ---------------- Arm switch. N = no guide at any episode ----------------
+def guided_probability(episode, arm="G"):
+    if arm == "N":
+        return 0.0
+
     if episode >= GUIDED_EPISODES:
         return GUIDED_END
     frac = (episode - 1) / max(1, GUIDED_EPISODES - 1)
@@ -118,7 +135,7 @@ def goal_for_episode(episode):
     return FINAL_GOAL
 
 
-def run_episode(env, agent, greedy, episode=0):
+def run_episode(env, agent, greedy, episode=0, arm="G"):
     """
     Run one episode. greedy=False trains (NoisyNet exploration, replay, updates);
     greedy=True evaluates with the deterministic mean-weight policy.
@@ -127,14 +144,18 @@ def run_episode(env, agent, greedy, episode=0):
     total_reward, losses = 0.0, []
     action_counts = [0] * 7
     reason, steps_taken, terminated = "timeout", 0, False
-    p_guided = 0.0 if greedy else guided_probability(episode)
+    # ---------------- Arm-aware guide; counters of guide-chosen steps ----------------
+    p_guided = 0.0 if greedy else guided_probability(episode, arm)
+    guided_steps, guided_noise_steps = 0, 0
 
     for step in range(MAX_STEPS):
         steps_taken = step + 1
         if greedy:
             action = agent.select_greedy_action(state)
         elif random.random() < p_guided:
+            guided_steps += 1                     
             if random.random() < GUIDED_NOISE:
+                guided_noise_steps += 1           
                 action = random.choices(range(7), weights=[4, 1, 1, 1, 1, 1, 1])[0]
             else:
                 action = heuristic_action(state, env.MAX_LIDAR)
@@ -168,25 +189,137 @@ def run_episode(env, agent, greedy, episode=0):
         "outcome": outcome,
         "loss": float(np.mean(losses)) if losses else float("nan"),
         "actions": action_counts,
+        # ---------------- Guide counters returned for the CSV ----------------
+        "p_guided": p_guided,
+        "guided_steps": guided_steps,
+        "guided_noise_steps": guided_noise_steps,
     }
 
 
-def main(args=None):
-    rclpy.init(args=args)
+
+EPISODE_FIELDS = [
+    "episode", "outcome", "reward", "steps", "env_steps_total", "loss",
+    "p_guided", "guided_steps", "guided_noise_steps", "replay_size",
+    "learning_steps", "goal_dist", "min_lidar", "wall_time_s",
+    "a0", "a1", "a2", "a3", "a4", "a5", "a6",
+]
+EVAL_FIELDS = ["episode", "env_steps_total", "wins", "n", "success_rate", "outcomes"]
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="Train Rainbow DQN for the guide ablation.")
+    p.add_argument("--arm", choices=["G", "N"], required=True,
+                   help="G = decaying scripted guide, N = no guide")
+    p.add_argument("--seed", type=int, default=SEED)
+    p.add_argument("--episodes", type=int, default=EPISODES)
+    p.add_argument("--eval-every", type=int, default=EVAL_EVERY)
+    p.add_argument("--eval-episodes", type=int, default=EVAL_EPISODES)
+    p.add_argument("--run-name", help="default: <arm>_s<seed>, e.g. N_s1")
+    p.add_argument("--results-dir", default="results",
+                   help="parent folder; each run gets results/<run-name>/")
+    p.add_argument("--overwrite", action="store_true",
+                   help="allow reusing an existing run folder (otherwise refuse)")
+    return p.parse_args(remove_ros_args(argv)[1:])
+
+
+def git_info():
+    """Commit hash and whether the working tree had uncommitted changes."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=here, text=True).strip()
+        dirty = bool(subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=here, text=True).strip())
+        return commit, dirty
+    except Exception:
+        return "unknown", None
+
+
+def write_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def save_plot(path, run_name, episode_rows, eval_rows):
+    """Four panels: reward, loss, steps + guided steps, greedy success."""
+    x = [r["episode"] for r in episode_rows]
+    rewards = [r["reward"] for r in episode_rows]
+    window = min(10, len(rewards))
+    moving = [np.mean(rewards[max(0, i - window + 1):i + 1]) for i in range(len(rewards))]
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    fig.suptitle(f"Rainbow DQN training - {run_name}")
+    axes[0, 0].plot(x, rewards, label="Episode reward")
+    axes[0, 0].plot(x, moving, label=f"Moving average ({window})")
+    axes[0, 0].set_title("Episode reward")
+    axes[0, 0].legend()
+    axes[0, 1].plot(x, [r["loss"] for r in episode_rows])
+    axes[0, 1].set_title("Mean distributional loss")
+    axes[1, 0].plot(x, [r["steps"] for r in episode_rows], label="steps")
+    axes[1, 0].plot(x, [r["guided_steps"] for r in episode_rows], label="guide-chosen steps")
+    axes[1, 0].set_title("Steps per episode")
+    axes[1, 0].legend()
+    if eval_rows:
+        axes[1, 1].plot([r["episode"] for r in eval_rows],
+                        [r["success_rate"] for r in eval_rows], marker="o")
+    axes[1, 1].set_ylim(-0.05, 1.05)
+    axes[1, 1].set_title("Greedy success (guide off)")
+    for ax in axes.flat:
+        ax.grid(True, alpha=0.3)
+        ax.set_xlabel("Training episode")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def main(argv=None):
+    args = parse_args(sys.argv if argv is None else argv)
+    run_name = args.run_name or f"{args.arm}_s{args.seed}"
+
+    # Every file of this run lives in results/<run_name>/ and carries the run name.
+    run_dir = os.path.abspath(os.path.join(args.results_dir, run_name))
+    if os.path.isdir(run_dir) and os.listdir(run_dir) and not args.overwrite:
+        sys.exit(f"{run_dir} already has files; refusing to overwrite (use --overwrite).")
+    os.makedirs(run_dir, exist_ok=True)
+
+    def out(suffix):
+        return os.path.join(run_dir, f"{run_name}_{suffix}")
+
+    model_path, best_path = out("model_final.pth"), out("model_best.pth")
+    episodes_csv, evals_csv = out("episodes.csv"), out("evals.csv")
+    meta_path, plot_path = out("run_meta.json"), out("training.png")
+
+    rclpy.init(args=argv if argv is not None else sys.argv)
     env = None
     agent = None
-    # Writes into runs/ in the current folder (git-ignored), never over the
-    # pilot checkpoints in ~/ros2_ws/src/mini_dqn_nav or ~/rainbow_backups.
-    model_path = os.path.abspath(os.path.join("runs", "rainbow_dqn_7actions.pth"))
-    best_path = model_path.replace(".pth", "_best.pth")
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    set_seed(args.seed)
 
-    set_seed(SEED)
+    commit, dirty = git_info()
+    meta = {
+        "run_name": run_name, "arm": args.arm, "seed": args.seed,
+        "episodes": args.episodes, "eval_every": args.eval_every,
+        "eval_episodes": args.eval_episodes, "max_steps": MAX_STEPS,
+        "updates_per_step": UPDATES_PER_STEP, "start_pose": START_POSE,
+        "goal": FINAL_GOAL,
+        "guide": {"start": GUIDED_START, "end": GUIDED_END,
+                  "episodes": GUIDED_EPISODES, "noise": GUIDED_NOISE,
+                  "active": args.arm == "G"},
+        "git_commit": commit, "git_dirty": dirty,
+        "torch_version": torch.__version__,
+        "start_time": datetime.now().isoformat(timespec="seconds"),
+        "end_time": None, "status": "running",
+    }
+    write_json(meta_path, meta)
 
-    rewards_history, losses_history = [], []
-    steps_history, outcomes = [], []
-    eval_history = []            # (episode, success_rate)
+    episode_rows, eval_rows = [], []
     best_success = -1.0
+    env_steps_total = 0
+    t0 = time.monotonic()
+    ep_file = open(episodes_csv, "w", newline="")
+    ev_file = open(evals_csv, "w", newline="")
+    ep_writer = csv.DictWriter(ep_file, fieldnames=EPISODE_FIELDS)
+    ev_writer = csv.DictWriter(ev_file, fieldnames=EVAL_FIELDS)
+    ep_writer.writeheader()
+    ev_writer.writeheader()
 
     try:
         env = RobotEnvironment()
@@ -199,7 +332,10 @@ def main(args=None):
             target_update_every=250,
             warmup_transitions=1000
         )
-        env.get_logger().info(f"Rainbow DQN device: {agent.device}")
+        meta["device"] = str(agent.device)
+        write_json(meta_path, meta)
+        env.get_logger().info(f"Run {run_name} | arm={args.arm} | device={agent.device}")
+        env.get_logger().info(f"Writing to {run_dir}")
 
         deadline = time.monotonic() + 10.0
         while rclpy.ok() and env.get_state() is None:
@@ -208,98 +344,99 @@ def main(args=None):
             rclpy.spin_once(env, timeout_sec=0.1)
 
         first = True
-        for episode in range(1, EPISODES + 1):
+        for episode in range(1, args.episodes + 1):
             env.goal_x, env.goal_y = goal_for_episode(episode)
             if not prepare_episode(env, first):
                 env.get_logger().warning("Stopping: Gazebo reset failed.")
+                meta["status"] = f"stopped: reset failed at episode {episode}"
                 break
             first = False
 
-            result = run_episode(env, agent, greedy=False, episode=episode)
+            result = run_episode(env, agent, greedy=False, episode=episode, arm=args.arm)
+            env_steps_total += result["steps"]
 
-            rewards_history.append(result["reward"])
-            losses_history.append(result["loss"])
-            steps_history.append(result["steps"])
-            outcomes.append(result["outcome"])
+            row = {
+                "episode": episode, "outcome": result["outcome"],
+                "reward": round(result["reward"], 4), "steps": result["steps"],
+                "env_steps_total": env_steps_total, "loss": result["loss"],
+                "p_guided": round(result["p_guided"], 4),
+                "guided_steps": result["guided_steps"],
+                "guided_noise_steps": result["guided_noise_steps"],
+                "replay_size": len(agent.memory),
+                "learning_steps": agent.learning_steps,
+                "goal_dist": round(env.last_goal_distance, 4),
+                "min_lidar": round(env.last_min_lidar, 4),
+                "wall_time_s": round(time.monotonic() - t0, 1),
+            }
+            row.update({f"a{i}": c for i, c in enumerate(result["actions"])})
+            episode_rows.append(row)
+            ep_writer.writerow(row)
+            ep_file.flush()        # data survives a crash or Ctrl+C
 
             env.get_logger().info(
-                f"Episode {episode}/{EPISODES} | {result['outcome']} | "
+                f"[{run_name}] Episode {episode}/{args.episodes} | {result['outcome']} | "
                 f"reward={result['reward']:.2f} | steps={result['steps']} | "
                 f"loss={result['loss']:.4f} | replay={len(agent.memory)} | "
-                f"guided={guided_probability(episode):.2f} | "
-                f"goal_dist={env.last_goal_distance:.2f} | "
-                f"min_lidar={env.last_min_lidar:.2f} | actions={result['actions']}"
+                f"guided={result['guided_steps']}/{result['steps']} | "
+                f"goal_dist={env.last_goal_distance:.2f} | actions={result['actions']}"
             )
             agent.save(model_path)
 
-            # Periodic greedy evaluation; keep the best checkpoint.
-            if EVAL_EVERY and episode % EVAL_EVERY == 0 and episode < EPISODES:
-                wins = 0
+            # Greedy evaluation (guide off for both arms). Now also runs at the
+            # last episode, so E* can be found at episode 200.
+            if args.eval_every and episode % args.eval_every == 0:
+                outcomes = []
                 env.goal_x, env.goal_y = FINAL_GOAL
-                for _ in range(EVAL_EPISODES):
+                for _ in range(args.eval_episodes):
                     if not prepare_episode(env, first=False):
                         break
-                    if run_episode(env, agent, greedy=True)["outcome"] == "goal_reached":
-                        wins += 1
-                rate = wins / EVAL_EPISODES
-                eval_history.append((episode, rate))
-                env.get_logger().info(
-                    f"[EVAL] episode {episode}: greedy success "
-                    f"{wins}/{EVAL_EPISODES}"
-                )
-                if rate > best_success:
+                    outcomes.append(run_episode(env, agent, greedy=True)["outcome"])
+                wins = outcomes.count("goal_reached")
+                n = len(outcomes)
+                rate = wins / n if n else float("nan")
+                ev = {"episode": episode, "env_steps_total": env_steps_total,
+                      "wins": wins, "n": n, "success_rate": rate,
+                      "outcomes": ";".join(outcomes)}
+                eval_rows.append(ev)
+                ev_writer.writerow(ev)
+                ev_file.flush()
+                env.get_logger().info(f"[{run_name}] [EVAL] episode {episode}: {wins}/{n}")
+                if n and rate > best_success:
                     best_success = rate
                     agent.save(best_path)
+        else:
+            meta["status"] = "completed"
 
-        counts = Counter(outcomes)
-        print("\n--- Episode Outcomes (training) ---")
+        counts = Counter(r["outcome"] for r in episode_rows)
+        print(f"\n--- {run_name}: training outcomes ---")
         for name, count in counts.items():
             print(f"{name}: {count}")
-        total = len(outcomes)
-        success = counts.get("goal_reached", 0)
-        print(
-            f"Training success rate: {100 * success / total:.1f}% ({success}/{total})"
-            if total else "No episodes completed."
-        )
-        print("Greedy evaluation history:", eval_history)
-        print("Rainbow checkpoint:", model_path)
-        print("Best-by-eval checkpoint:", best_path)
-
-        x = np.arange(1, len(rewards_history) + 1)
-        window = min(10, len(rewards_history))
-        moving = [
-            np.mean(rewards_history[max(0, i - window + 1):i + 1])
-            for i in range(len(rewards_history))
-        ]
-        fig, axes = plt.subplots(2, 2, figsize=(13, 9))
-        fig.suptitle("TurtleBot3 Rainbow DQN - Training")
-        axes[0, 0].plot(x, rewards_history, label="Episode reward")
-        axes[0, 0].plot(x, moving, label=f"Moving average ({window})")
-        axes[0, 0].set_title("Episode reward")
-        axes[0, 0].legend()
-        axes[0, 1].plot(x, losses_history)
-        axes[0, 1].set_title("Mean distributional loss")
-        axes[1, 0].plot(x, steps_history)
-        axes[1, 0].set_title("Steps per episode")
-        axes[1, 1].bar(list(counts.keys()), list(counts.values()))
-        axes[1, 1].set_title("Training outcomes")
-        axes[1, 1].tick_params(axis="x", rotation=20)
-        for ax in axes.flat:
-            ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        fig.savefig("rainbow_training_performance.png", dpi=150)
-        plt.show()
+        print("Greedy evaluations:", [(r["episode"], r["wins"]) for r in eval_rows])
 
     except KeyboardInterrupt:
+        meta["status"] = f"interrupted after {len(episode_rows)} episodes"
         if env is not None:
             env.get_logger().info("Training interrupted.")
     except Exception as error:
+        meta["status"] = f"failed: {error}"
         if env is not None:
             env.get_logger().error(f"Training failed: {error}")
         raise
     finally:
+        ep_file.close()
+        ev_file.close()
         if agent is not None:
             agent.save(model_path)
+            meta["learning_steps"] = agent.learning_steps
+        meta["episodes_completed"] = len(episode_rows)
+        meta["env_steps_total"] = env_steps_total
+        meta["wall_time_h"] = round((time.monotonic() - t0) / 3600, 3)
+        meta["end_time"] = datetime.now().isoformat(timespec="seconds")
+        write_json(meta_path, meta)
+        if episode_rows:
+            save_plot(plot_path, run_name, episode_rows, eval_rows)
+            print("Figure:", plot_path)
+        print("Run folder:", run_dir)
         if env is not None:
             try:
                 env.publish_stop()
@@ -308,6 +445,7 @@ def main(args=None):
                 pass
         if rclpy.ok():
             rclpy.shutdown()
+# ---------------- END CHANGED ----------------
 
 
 if __name__ == "__main__":

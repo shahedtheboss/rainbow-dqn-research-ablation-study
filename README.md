@@ -18,10 +18,11 @@ code is being written from scratch.
 
 ## Build
 
-This repo has the same package names as `~/ros2_ws/src/turtlebot3_*`, so build it in its own workspace, not next to them:
+The repo root is itself the colcon workspace. Build it in place:
 
-    mkdir -p ~/rainbow_ws/src && ln -s ~/rainbow-dqn-research-ablation-study ~/rainbow_ws/src/rainbow
-    cd ~/rainbow_ws && source /opt/ros/humble/setup.bash && colcon build --symlink-install
+    cd ~/rainbow-dqn-research-ablation-study && source /opt/ros/humble/setup.bash && colcon build --symlink-install
+
+Then source `install/setup.bash` from this repo only. Do not also source another workspace that contains `turtlebot3_*` packages (e.g. `~/ros2_ws`), since the package names are the same.
 
 ## License
 

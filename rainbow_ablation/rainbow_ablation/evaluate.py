@@ -5,9 +5,11 @@ greedily for at most MAX_STEPS actions, and is logged to a CSV file. Greedy
 evaluation uses the NoisyNet mean weights, so it is deterministic for a fixed
 checkpoint and simulator state.
 
-Examples (run from the package folder after sourcing ROS, the workspace and the venv):
-  python -m rainbow_ablation.evaluate --model runs/G_s1/model_final.pth --episodes 50 --label G_s1 --out-csv runs/G_s1/final_eval.csv
-  python -m rainbow_ablation.evaluate --policy heuristic --episodes 50 --label H --out-csv runs/H/final_eval.csv
+# ---------------- CHANGED: examples match train.py's results/<run>/<run>_* layout ----------------
+Examples (run from the repo root after sourcing ROS, install/setup.bash and the venv):
+  python3 -m rainbow_ablation.evaluate --model results/G_s1/G_s1_model_final.pth --episodes 50 --label G_s1 --out-csv results/G_s1/G_s1_final_eval.csv
+  python3 -m rainbow_ablation.evaluate --policy heuristic --episodes 50 --label H --out-csv results/H/H_final_eval.csv
+# ---------------- END CHANGED ----------------
 """
 
 import argparse
@@ -38,8 +40,18 @@ MAX_STEPS = 250                     # same episode cap as training
 ROBOT_NAME = "turtlebot3_burger"    # entity name in the running Gazebo world
 GOAL_X, GOAL_Y = 2.0, -2.0
 SETTLE_SEC = 2.0                    # wait after reset/teleport so sensors refresh
-# Pilot start, used by the earlier evaluation (R7). Other poses come from --starts.
-DEFAULT_STARTS = [(0.2, 0.2, 0.0)]
+# ---------------- CHANGED: study evaluation poses (was the pilot's single pose (0.2, 0.2, 0)) ----------------
+# Pose 0 is the training start. Poses 1-4 were chosen from the stage-4 world file:
+# each is >= 0.5 m from every wall and away from both cylinders' first 15 s of motion.
+# With 50 episodes, each pose gets 10 (episode e uses pose (e-1) mod 5).
+DEFAULT_STARTS = [
+    (0.0, 0.0, 0.0),            # P0 training start; wall inner_wall_3 blocks the straight line
+    (-1.5, -0.8, 0.0),          # P1 far west, behind inner_wall_7, 3.7 m from goal
+    (0.0, 1.0, -math.pi / 2),   # P2 north, facing south, 3.6 m from goal
+    (1.8, -0.2, -math.pi / 2),  # P3 east, facing the goal, 1.8 m (easy pose)
+    (0.3, -1.8, 0.0),           # P4 south corridor, facing the goal, 1.7 m (easy pose)
+]
+# ---------------- END CHANGED ----------------
 # Actions the training guide's noise draws from (same weights as train.py).
 NOISE_WEIGHTS = [4, 1, 1, 1, 1, 1, 1]
 OUTCOMES = ("goal_reached", "collision_warning", "no_progress", "timeout")

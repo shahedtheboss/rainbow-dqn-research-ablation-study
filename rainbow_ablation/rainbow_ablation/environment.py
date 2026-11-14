@@ -103,15 +103,17 @@ class RobotEnvironment(Node):
 
         num_sectors = self.NUM_SECTORS
 
-        max_range = msg.max_range
+        # ---------------- CHANGED: LaserScan field is range_max; fallback uses 3.5 m ----------------
+        max_range = msg.range_max
 
         if not math.isfinite(max_range):
 
             self.get_logger().error(
-                'LaserScan max_range is not finite. Using default value of 3.5 meters.'
+                'LaserScan range_max is not finite. Using default value of 3.5 meters.'
             )
 
-            return [0.0] * num_sectors
+            max_range = self.MAX_LIDAR
+        # ---------------- END CHANGED ----------------
 
         sector_width = (2.0 * math.pi) / num_sectors
 
@@ -325,7 +327,9 @@ class RobotEnvironment(Node):
         return self.normalize(next_state), reward, terminated, reason
 
 
-    def set_start(self, x, y, yaw, model_name='burger'):
+    # ---------------- CHANGED: Gazebo entity is 'turtlebot3_burger' (verified with GetEntityState) ----------------
+    def set_start(self, x, y, yaw, model_name='turtlebot3_burger'):
+    # ---------------- END CHANGED ----------------
 
         if not self.set_state_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().error('SetEntityState service not available.')
@@ -342,12 +346,15 @@ class RobotEnvironment(Node):
         while rclpy.ok() and not future.done() and time.monotonic() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
 
-        # Check if the service call completed successfully.
-        ok = future.done()
+        # ---------------- CHANGED: success needs a reply with success=True, not just a finished call ----------------
+        ok = future.done() and future.result() is not None and future.result().success
         if ok:
             self.begin_episode(start=(x, y, yaw))
+        else:
+            self.get_logger().error(f'set_start failed for entity {model_name!r}.')
 
-        return future.done()
+        return ok
+        # ---------------- END CHANGED ----------------
 
 def main(args=None):
     rclpy.init(args=args)

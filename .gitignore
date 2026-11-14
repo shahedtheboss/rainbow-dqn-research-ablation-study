@@ -11,3 +11,6 @@ reports/
 research_notes/
 .vscode/
 Related Papers for Literature Review/
+
+# Smoke-test outputs (pre-study checks, not study data)
+results_smoke/
