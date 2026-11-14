@@ -5,3 +5,8 @@ install/
 log/
 runs/
 *.pth
+
+# Private research material, kept local only
+reports/
+research_notes/
+.vscode/
